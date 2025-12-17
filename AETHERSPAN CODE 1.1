@@ -1,0 +1,1128 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import threading
+import time
+import uuid
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+APP_NAME = "AETHERSPAN"
+APP_VERSION = "1.1"
+
+# ----------------------------
+# helpers
+# ----------------------------
+
+def jcanon(x: Any) -> str:
+    return json.dumps(x, sort_keys=True, separators=(",", ":"), default=str)
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def hmac_hex(key: str, msg: str) -> str:
+    return hmac.new(key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+def now_wall() -> float:
+    return time.time()
+
+def now_mono() -> float:
+    return time.monotonic()
+
+# ----------------------------
+# config
+# ----------------------------
+
+@dataclass
+class BridgeConfig:
+    # anonymity
+    store_session_raw: bool = False
+    session_salt: str = os.environ.get("AETHERSPAN_SESSION_SALT", "change-me")
+
+    # recording
+    record_teleop: bool = True
+    record_autonomy: bool = True
+    ring_max_frames: int = 5000
+
+    # deferred commit
+    commit_enabled: bool = True
+    commit_flush_every: int = 100
+    commit_flush_ms: int = 100
+    commit_queue_max: int = 20000
+
+    # replay
+    replay_on_disconnect: bool = True
+    replay_last_n: int = 200
+    replay_tick_ms: int = 25
+
+    # mapping
+    mapping_mode: str = "gamepad_axes"  # "gamepad_axes" | "passthrough_only"
+
+    # peer messaging + sync
+    peer_enabled: bool = True
+    sync_enabled: bool = True
+    robot_comms_enabled: bool = True
+    robot_broadcast_interval_ms: int = 500
+
+    # billing / subscription / credits
+    billing_enabled: bool = True
+    billing_mode: str = "enforce"  # "off" | "meter_only" | "enforce"
+    billing_account_mode: str = "session"  # "session" | "provided"
+    cost_per_teleop_frame: float = 0.001
+    cost_per_peer_message: float = 0.005
+    cost_per_sync_block: float = 0.0005
+    cost_per_kb_logged: float = 0.0002
+
+# ----------------------------
+# persistence
+# ----------------------------
+
+@dataclass(frozen=True)
+class Block:
+    id: str
+    ts: float
+    world: str
+    prev_hash: Optional[str]
+    payload: str
+    hash: str
+
+class Persistence:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.lock = threading.RLock()
+        self._init()
+
+    def _c(self) -> sqlite3.Connection:
+        c = sqlite3.connect(self.db_path, check_same_thread=False)
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA synchronous=NORMAL;")
+        return c
+
+    def _init(self):
+        with self._c() as c:
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS blocks(
+                    id TEXT PRIMARY KEY,
+                    ts REAL,
+                    world TEXT,
+                    prev_hash TEXT,
+                    payload TEXT,
+                    hash TEXT
+                )"""
+            )
+            c.execute("CREATE INDEX IF NOT EXISTS idx_blocks_world_ts ON blocks(world, ts);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_blocks_world_hash ON blocks(world, hash);")
+
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS sessions(
+                    id TEXT PRIMARY KEY,
+                    human_active INTEGER,
+                    start_ts REAL,
+                    end_ts REAL
+                )"""
+            )
+
+            # peers (shared-key HMAC per peer)
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS peers(
+                    peer_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    url TEXT,
+                    shared_key TEXT,
+                    enabled INTEGER
+                )"""
+            )
+
+            # billing
+            c.execute("""CREATE TABLE IF NOT EXISTS wallets(account_id TEXT PRIMARY KEY, bal REAL)""")
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS usage(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT,
+                    ts REAL,
+                    kind TEXT,
+                    units REAL,
+                    cost REAL
+                )"""
+            )
+            c.execute("CREATE INDEX IF NOT EXISTS idx_usage_account_ts ON usage(account_id, ts);")
+
+            # identity
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS identity(
+                    k TEXT PRIMARY KEY,
+                    v TEXT
+                )"""
+            )
+
+    # blocks
+    def head_hash(self, world: str) -> Optional[str]:
+        with self._c() as c:
+            r = c.execute(
+                "SELECT hash FROM blocks WHERE world=? ORDER BY ts DESC LIMIT 1",
+                (world,),
+            ).fetchone()
+            return r[0] if r else None
+
+    def append_many(self, blocks: List[Block]):
+        if not blocks:
+            return
+        with self.lock, self._c() as c:
+            c.executemany(
+                "INSERT INTO blocks VALUES (?,?,?,?,?,?)",
+                [(b.id, b.ts, b.world, b.prev_hash, b.payload, b.hash) for b in blocks],
+            )
+
+    def get_blocks_since_ts(self, world: str, since_ts: float, limit: int = 1000) -> List[Dict[str, Any]]:
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT id, ts, world, prev_hash, payload, hash FROM blocks WHERE world=? AND ts>? ORDER BY ts ASC LIMIT ?",
+                (world, since_ts, limit),
+            ).fetchall()
+        return [
+            {"id": r[0], "ts": r[1], "world": r[2], "prev_hash": r[3], "payload": r[4], "hash": r[5]}
+            for r in rows
+        ]
+
+    # sessions
+    def session_start(self, sid: str):
+        with self._c() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO sessions(id, human_active, start_ts, end_ts) VALUES(?, 1, ?, NULL)",
+                (sid, now_wall()),
+            )
+
+    def session_end(self, sid: str):
+        with self._c() as c:
+            c.execute(
+                "UPDATE sessions SET human_active=0, end_ts=? WHERE id=?",
+                (now_wall(), sid),
+            )
+
+    def sessions(self) -> List[Dict[str, Any]]:
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT id, human_active, start_ts, end_ts FROM sessions ORDER BY start_ts DESC"
+            ).fetchall()
+            return [{"id": r[0], "human_active": int(r[1]), "start_ts": r[2], "end_ts": r[3]} for r in rows]
+
+    # peers
+    def upsert_peer(self, peer_id: str, name: str, url: str, shared_key: str, enabled: bool = True):
+        with self._c() as c:
+            c.execute(
+                """INSERT INTO peers(peer_id, name, url, shared_key, enabled)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(peer_id) DO UPDATE SET name=excluded.name, url=excluded.url, shared_key=excluded.shared_key, enabled=excluded.enabled
+                """,
+                (peer_id, name, url, shared_key, 1 if enabled else 0),
+            )
+
+    def list_peers(self) -> List[Dict[str, Any]]:
+        with self._c() as c:
+            rows = c.execute("SELECT peer_id, name, url, enabled FROM peers ORDER BY name ASC").fetchall()
+        return [{"peer_id": r[0], "name": r[1], "url": r[2], "enabled": bool(r[3])} for r in rows]
+
+    def get_peer_secret(self, peer_id: str) -> Optional[Tuple[str, str, bool]]:
+        with self._c() as c:
+            r = c.execute("SELECT url, shared_key, enabled FROM peers WHERE peer_id=?", (peer_id,)).fetchone()
+        if not r:
+            return None
+        return (r[0], r[1], bool(r[2]))
+
+    # billing
+    def wallet_get(self, account_id: str) -> float:
+        with self._c() as c:
+            r = c.execute("SELECT bal FROM wallets WHERE account_id=?", (account_id,)).fetchone()
+        return float(r[0]) if r else 0.0
+
+    def wallet_add(self, account_id: str, delta: float):
+        with self._c() as c:
+            c.execute(
+                """INSERT INTO wallets(account_id, bal) VALUES(?,?)
+                   ON CONFLICT(account_id) DO UPDATE SET bal=bal+excluded.bal""",
+                (account_id, float(delta)),
+            )
+
+    def usage_add(self, account_id: str, kind: str, units: float, cost: float):
+        with self._c() as c:
+            c.execute(
+                "INSERT INTO usage(account_id, ts, kind, units, cost) VALUES(?,?,?,?,?)",
+                (account_id, now_wall(), kind, float(units), float(cost)),
+            )
+
+    def usage_recent(self, account_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT ts, kind, units, cost FROM usage WHERE account_id=? ORDER BY ts DESC LIMIT ?",
+                (account_id, int(limit)),
+            ).fetchall()
+        return [{"ts": r[0], "kind": r[1], "units": r[2], "cost": r[3]} for r in rows]
+
+    # identity
+    def identity_get(self, k: str) -> Optional[str]:
+        with self._c() as c:
+            r = c.execute("SELECT v FROM identity WHERE k=?", (k,)).fetchone()
+        return r[0] if r else None
+
+    def identity_set(self, k: str, v: str):
+        with self._c() as c:
+            c.execute(
+                """INSERT INTO identity(k, v) VALUES(?,?)
+                   ON CONFLICT(k) DO UPDATE SET v=excluded.v""",
+                (k, v),
+            )
+
+# ----------------------------
+# recorder + committer
+# ----------------------------
+
+@dataclass
+class Frame:
+    kind: str                 # "teleop" | "autonomy" | "event" | "peer" | "sync"
+    t_wall: float
+    t_mono: float
+    session: Optional[str]
+    account: Optional[str]
+    input_frame: Dict[str, Any]
+    device_cmd: Dict[str, Any]
+    device_state: Dict[str, Any]
+    device_receipt: Dict[str, Any]
+
+class RingBuffer:
+    def __init__(self, max_frames: int):
+        self.max_frames = max_frames
+        self._buf: List[Frame] = []
+        self._lock = threading.RLock()
+
+    def push(self, f: Frame):
+        with self._lock:
+            self._buf.append(f)
+            if len(self._buf) > self.max_frames:
+                drop = len(self._buf) - self.max_frames
+                del self._buf[:drop]
+
+    def last_n(self, n: int, *, kind: Optional[str] = None) -> List[Frame]:
+        with self._lock:
+            if n <= 0:
+                return []
+            if kind is None:
+                return list(self._buf[-n:])
+            out = []
+            for f in reversed(self._buf):
+                if f.kind == kind:
+                    out.append(f)
+                    if len(out) >= n:
+                        break
+            return list(reversed(out))
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            kinds: Dict[str, int] = {}
+            for f in self._buf:
+                kinds[f.kind] = kinds.get(f.kind, 0) + 1
+            return {"frames": len(self._buf), "max_frames": self.max_frames, "kinds": kinds}
+
+class DeferredCommitter:
+    def __init__(self, p: Persistence, world: str, *, flush_every: int, flush_ms: int, queue_max: int):
+        self.p = p
+        self.world = world
+        self.flush_every = flush_every
+        self.flush_ms = flush_ms
+        self.q: asyncio.Queue[Frame] = asyncio.Queue(maxsize=queue_max)
+        self._task: Optional[asyncio.Task] = None
+        self._last_hash: Optional[str] = None
+
+    async def start(self):
+        if self._task is not None:
+            return
+        self._last_hash = self.p.head_hash(self.world)
+        self._task = asyncio.create_task(self._run())
+
+    async def submit(self, f: Frame):
+        try:
+            self.q.put_nowait(f)
+        except asyncio.QueueFull:
+            pass
+
+    def _make_block(self, prev_hash: Optional[str], payload_obj: Dict[str, Any], ts: float) -> Tuple[Block, str]:
+        payload = jcanon(payload_obj)
+        bid = sha256_hex(f"{prev_hash or ''}|{self.world}|{payload}")[:32]
+        h = sha256_hex(jcanon({"id": bid, "ts": ts, "world": self.world, "prev_hash": prev_hash, "payload": payload}))
+        return Block(id=bid, ts=ts, world=self.world, prev_hash=prev_hash, payload=payload, hash=h), h
+
+    async def _run(self):
+        buf: List[Frame] = []
+        last_flush = now_wall()
+
+        while True:
+            timeout = self.flush_ms / 1000.0
+            try:
+                f = await asyncio.wait_for(self.q.get(), timeout=timeout)
+                buf.append(f)
+            except asyncio.TimeoutError:
+                pass
+
+            now = now_wall()
+            if buf and (len(buf) >= self.flush_every or (now - last_flush) >= timeout):
+                blocks: List[Block] = []
+                prev = self._last_hash
+                for fr in buf:
+                    payload_obj = {
+                        "kind": fr.kind,
+                        "t_wall": fr.t_wall,
+                        "t_mono": fr.t_mono,
+                        "session": fr.session,
+                        "account": fr.account,
+                        "input_frame": fr.input_frame,
+                        "device_cmd": fr.device_cmd,
+                        "device_state": fr.device_state,
+                        "device_receipt": fr.device_receipt,
+                    }
+                    b, new_hash = self._make_block(prev, payload_obj, ts=fr.t_wall)
+                    blocks.append(b)
+                    prev = new_hash
+
+                self.p.append_many(blocks)
+                self._last_hash = prev
+                buf.clear()
+                last_flush = now
+
+# ----------------------------
+# device adapter
+# ----------------------------
+
+class DeviceAdapter:
+    async def apply(self, cmd: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        raise NotImplementedError
+
+class SimulatedKinematicsAdapter(DeviceAdapter):
+    def __init__(self):
+        self.state = {
+            "pose": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0, "pitch": 0.0},
+            "vel": {"vx": 0.0, "vy": 0.0, "wyaw": 0.0},
+            "grip": {"L": 0.0, "R": 0.0},
+            "mode": "idle",
+        }
+
+    async def apply(self, cmd: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        mode = cmd.get("mode", "teleop")
+        vx = clamp(float(cmd.get("vx", 0.0)), -1.0, 1.0)
+        vy = clamp(float(cmd.get("vy", 0.0)), -1.0, 1.0)
+        wyaw = clamp(float(cmd.get("wyaw", 0.0)), -2.0, 2.0)
+        pitch = float(cmd.get("pitch", 0.0))
+        gL = clamp(float(cmd.get("grip_L", cmd.get("L", 0.0))), 0.0, 1.0)
+        gR = clamp(float(cmd.get("grip_R", cmd.get("R", 0.0))), 0.0, 1.0)
+
+        self.state["vel"] = {"vx": vx, "vy": vy, "wyaw": wyaw}
+        self.state["pose"]["x"] += vx * 0.05
+        self.state["pose"]["y"] += vy * 0.05
+        self.state["pose"]["yaw"] = (self.state["pose"]["yaw"] + wyaw * 5.0) % 360.0
+        self.state["pose"]["pitch"] = clamp(self.state["pose"]["pitch"] + pitch * 2.0, -90.0, 90.0)
+        self.state["grip"] = {"L": gL, "R": gR}
+        self.state["mode"] = mode
+        return dict(self.state), {"ok": True, "mode": mode}
+
+# ----------------------------
+# bridge core
+# ----------------------------
+
+class BridgeCore:
+    def __init__(self, p: Persistence, cfg: BridgeConfig):
+        self.p = p
+        self.cfg = cfg
+
+        self.rec = RingBuffer(cfg.ring_max_frames)
+        self.device: DeviceAdapter = SimulatedKinematicsAdapter()
+
+        self.instance_id, self.instance_secret = self._load_or_create_identity()
+
+        self.world_name = f"{APP_NAME}Core"
+        self.committer = DeferredCommitter(
+            p, self.world_name,
+            flush_every=cfg.commit_flush_every,
+            flush_ms=cfg.commit_flush_ms,
+            queue_max=cfg.commit_queue_max,
+        )
+
+        self._active_session: Optional[str] = None
+        self._active_account: Optional[str] = None
+        self._human_active = False
+        self._latest_state: Dict[str, Any] = {}
+        self._latest_receipt: Dict[str, Any] = {}
+        self._lock = asyncio.Lock()
+
+        self._last_robot_broadcast_wall = 0.0
+
+        self.admin_key = os.environ.get("AETHERSPAN_ADMIN_KEY", "")
+
+    def _load_or_create_identity(self) -> Tuple[str, str]:
+        iid = self.p.identity_get("instance_id")
+        sec = self.p.identity_get("instance_secret")
+        if iid and sec:
+            return iid, sec
+        iid = "inst_" + sha256_hex(str(uuid.uuid4()))[:16]
+        sec = "sec_" + sha256_hex(str(uuid.uuid4()))[:32]
+        self.p.identity_set("instance_id", iid)
+        self.p.identity_set("instance_secret", sec)
+        return iid, sec
+
+    def _session_id(self, raw_session_id: str) -> str:
+        if self.cfg.store_session_raw:
+            return raw_session_id
+        return sha256_hex(f"{self.cfg.session_salt}:{raw_session_id}")
+
+    def _account_id(self, sid: str, input_frame: Optional[Dict[str, Any]] = None) -> str:
+        if self.cfg.billing_account_mode == "provided" and input_frame and isinstance(input_frame.get("account_id"), str):
+            # still anonymous-ish: hash the provided id so we don't store raw labels by default
+            return sha256_hex(f"acct:{input_frame['account_id']}")
+        return sha256_hex(f"acct_session:{sid}")
+
+    async def start(self):
+        if self.cfg.commit_enabled:
+            await self.committer.start()
+
+    # ---------------- billing ----------------
+
+    def _billing_effective_mode(self) -> str:
+        if not self.cfg.billing_enabled:
+            return "off"
+        return self.cfg.billing_mode
+
+    def _charge(self, account_id: str, kind: str, units: float, cost: float) -> bool:
+        mode = self._billing_effective_mode()
+        if mode == "off":
+            return True
+
+        self.p.usage_add(account_id, kind, units, cost)
+
+        if mode == "meter_only":
+            return True
+
+        bal = self.p.wallet_get(account_id)
+        if bal < cost:
+            return False
+        self.p.wallet_add(account_id, -cost)
+        return True
+
+    # ---------------- mapping ----------------
+
+    def _map_input_to_device_cmd(self, input_frame: Dict[str, Any]) -> Dict[str, Any]:
+        if "device_cmd" in input_frame and isinstance(input_frame["device_cmd"], dict):
+            return dict(input_frame["device_cmd"])
+
+        if self.cfg.mapping_mode == "passthrough_only":
+            return {"mode": "teleop"}
+
+        lx = float(input_frame.get("left_stick_x", 0.0))
+        ly = float(input_frame.get("left_stick_y", 0.0))
+        rx = float(input_frame.get("right_stick_x", 0.0))
+        ry = float(input_frame.get("right_stick_y", 0.0))
+        triggers = input_frame.get("triggers", {}) or {}
+
+        return {
+            "mode": "teleop",
+            "vx": lx,
+            "vy": ly,
+            "wyaw": rx,
+            "pitch": ry,
+            "grip_L": float(triggers.get("L", 0.0)),
+            "grip_R": float(triggers.get("R", 0.0)),
+            "buttons": input_frame.get("buttons", {}) or {},
+        }
+
+    # ---------------- peers ----------------
+
+    def _peer_envelope(self, peer_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        # HMAC with peer shared key (symmetric)
+        peer = self.p.get_peer_secret(peer_id)
+        if not peer:
+            raise ValueError("unknown_peer")
+        url, shared_key, enabled = peer
+        if not enabled:
+            raise ValueError("peer_disabled")
+
+        msg = {
+            "from_instance": self.instance_id,
+            "to_peer": peer_id,
+            "ts": now_wall(),
+            "nonce": sha256_hex(str(uuid.uuid4()))[:16],
+            "body": body,
+        }
+        sig = hmac_hex(shared_key, jcanon(msg))
+        msg["sig"] = sig
+        return msg
+
+    def _peer_verify(self, from_peer_id: str, msg: Dict[str, Any]) -> bool:
+        peer = self.p.get_peer_secret(from_peer_id)
+        if not peer:
+            return False
+        _url, shared_key, enabled = peer
+        if not enabled:
+            return False
+        sig = msg.get("sig", "")
+        unsigned = dict(msg)
+        unsigned.pop("sig", None)
+        expect = hmac_hex(shared_key, jcanon(unsigned))
+        return hmac.compare_digest(sig, expect)
+
+    async def peer_send(self, peer_id: str, body: Dict[str, Any], *, account_id: Optional[str]) -> Dict[str, Any]:
+        peer = self.p.get_peer_secret(peer_id)
+        if not peer:
+            return {"ok": False, "reason": "unknown_peer"}
+        url, _k, enabled = peer
+        if not enabled:
+            return {"ok": False, "reason": "peer_disabled"}
+
+        if account_id:
+            ok = self._charge(account_id, "peer_message", 1.0, self.cfg.cost_per_peer_message)
+            if not ok:
+                return {"ok": False, "reason": "insufficient_credits"}
+
+        env = self._peer_envelope(peer_id, body)
+
+        def _post_json(u: str, payload: Dict[str, Any]) -> Tuple[int, str]:
+            data = jcanon(payload).encode("utf-8")
+            req = urllib.request.Request(
+                u.rstrip("/") + "/peer/message",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return resp.status, resp.read().decode("utf-8")
+            except Exception as e:
+                return 0, str(e)
+
+        status, text = await asyncio.to_thread(_post_json, url, env)
+
+        fr = Frame(
+            kind="peer",
+            t_wall=now_wall(),
+            t_mono=now_mono(),
+            session=self._active_session,
+            account=account_id,
+            input_frame={"direction": "outbound", "peer_id": peer_id},
+            device_cmd={},
+            device_state=self._latest_state or {},
+            device_receipt={"http_status": status, "resp": text[:2000]},
+        )
+        self.rec.push(fr)
+        if self.cfg.commit_enabled:
+            await self.committer.submit(fr)
+
+        return {"ok": status == 200, "http_status": status, "resp": text[:2000]}
+
+    # ---------------- lifecycle ----------------
+
+    async def on_connect(self, raw_session_id: str):
+        sid = self._session_id(raw_session_id)
+        acct = self._account_id(sid, None)
+
+        async with self._lock:
+            self._active_session = sid
+            self._active_account = acct
+            self._human_active = True
+
+        self.p.session_start(sid)
+
+        fr = Frame(
+            kind="event",
+            t_wall=now_wall(),
+            t_mono=now_mono(),
+            session=sid,
+            account=acct,
+            input_frame={"event": "connect", "instance_id": self.instance_id},
+            device_cmd={},
+            device_state=self._latest_state or {},
+            device_receipt={"event": "connect"},
+        )
+        self.rec.push(fr)
+        if self.cfg.commit_enabled:
+            await self.committer.submit(fr)
+
+    async def on_disconnect(self):
+        async with self._lock:
+            sid = self._active_session
+            acct = self._active_account
+            self._human_active = False
+
+        if sid:
+            self.p.session_end(sid)
+
+        fr = Frame(
+            kind="event",
+            t_wall=now_wall(),
+            t_mono=now_mono(),
+            session=sid,
+            account=acct,
+            input_frame={"event": "disconnect"},
+            device_cmd={},
+            device_state=self._latest_state or {},
+            device_receipt={"event": "disconnect"},
+        )
+        self.rec.push(fr)
+        if self.cfg.commit_enabled:
+            await self.committer.submit(fr)
+
+        if self.cfg.replay_on_disconnect:
+            asyncio.create_task(self._autonomous_replay_task(sid, acct))
+
+    async def process_teleop_frame(self, input_frame: Dict[str, Any]) -> Dict[str, Any]:
+        async with self._lock:
+            sid = self._active_session
+            human_active = self._human_active
+            acct = self._active_account
+
+        if not sid or not human_active:
+            return {"ok": False, "reason": "no_active_human_session", "state": self._latest_state, "receipt": self._latest_receipt}
+
+        # allow per-frame account (optional)
+        acct = self._account_id(sid, input_frame)
+        self._active_account = acct
+
+        device_cmd = self._map_input_to_device_cmd(input_frame)
+
+        # billing: teleop frame + approximate log KB
+        payload_kb = max(1.0, len(jcanon({"input": input_frame, "cmd": device_cmd}).encode("utf-8")) / 1024.0)
+        if self._billing_effective_mode() != "off":
+            ok1 = self._charge(acct, "teleop_frame", 1.0, self.cfg.cost_per_teleop_frame)
+            ok2 = self._charge(acct, "log_kb", payload_kb, payload_kb * self.cfg.cost_per_kb_logged)
+            if self._billing_effective_mode() == "enforce" and (not ok1 or not ok2):
+                return {"ok": False, "reason": "insufficient_credits"}
+
+        state, receipt = await self.device.apply(device_cmd)
+        self._latest_state = state
+        self._latest_receipt = receipt
+
+        if self.cfg.record_teleop:
+            fr = Frame(
+                kind="teleop",
+                t_wall=now_wall(),
+                t_mono=now_mono(),
+                session=sid,
+                account=acct,
+                input_frame=input_frame,
+                device_cmd=device_cmd,
+                device_state=state,
+                device_receipt=receipt,
+            )
+            self.rec.push(fr)
+            if self.cfg.commit_enabled:
+                await self.committer.submit(fr)
+
+        # optional robot comms broadcast (high-level status)
+        if self.cfg.peer_enabled and self.cfg.robot_comms_enabled:
+            await self._maybe_broadcast_robot_status(acct)
+
+        return {"ok": True, "state": state, "receipt": receipt, "account": acct}
+
+    async def _autonomous_replay_task(self, sid: Optional[str], acct: Optional[str]):
+        teleop_frames = self.rec.last_n(self.cfg.replay_last_n, kind="teleop")
+        if not teleop_frames:
+            return
+
+        for fr in teleop_frames:
+            device_cmd = dict(fr.device_cmd)
+            device_cmd["mode"] = "autonomy"
+
+            # billing: autonomy logging (optional); treat as log_kb only
+            payload_kb = max(1.0, len(jcanon({"cmd": device_cmd}).encode("utf-8")) / 1024.0)
+            if acct and self._billing_effective_mode() != "off":
+                ok = self._charge(acct, "autonomy_log_kb", payload_kb, payload_kb * self.cfg.cost_per_kb_logged)
+                if self._billing_effective_mode() == "enforce" and (not ok):
+                    break
+
+            state, receipt = await self.device.apply(device_cmd)
+            self._latest_state = state
+            self._latest_receipt = receipt
+
+            if self.cfg.record_autonomy:
+                afr = Frame(
+                    kind="autonomy",
+                    t_wall=now_wall(),
+                    t_mono=now_mono(),
+                    session=sid,
+                    account=acct,
+                    input_frame={"replay_from": "teleop", "source_t_mono": fr.t_mono},
+                    device_cmd=device_cmd,
+                    device_state=state,
+                    device_receipt=receipt,
+                )
+                self.rec.push(afr)
+                if self.cfg.commit_enabled:
+                    await self.committer.submit(afr)
+
+            await asyncio.sleep(self.cfg.replay_tick_ms / 1000.0)
+
+    async def _maybe_broadcast_robot_status(self, account_id: Optional[str]):
+        now = now_wall()
+        if (now - self._last_robot_broadcast_wall) * 1000.0 < float(self.cfg.robot_broadcast_interval_ms):
+            return
+        self._last_robot_broadcast_wall = now
+
+        peers = [p for p in self.p.list_peers() if p["enabled"]]
+        if not peers:
+            return
+
+        body = {
+            "type": "robot_status",
+            "instance_id": self.instance_id,
+            "ts": now,
+            "status": {
+                "mode": (self._latest_state.get("mode") if isinstance(self._latest_state, dict) else None),
+                "pose": (self._latest_state.get("pose") if isinstance(self._latest_state, dict) else None),
+            },
+        }
+
+        # fire-and-forget sends
+        for peer in peers:
+            asyncio.create_task(self.peer_send(peer["peer_id"], body, account_id=account_id))
+
+    # ---------------- status + config ----------------
+
+    def config_dict(self) -> Dict[str, Any]:
+        return {
+            "store_session_raw": self.cfg.store_session_raw,
+            "record_teleop": self.cfg.record_teleop,
+            "record_autonomy": self.cfg.record_autonomy,
+            "ring_max_frames": self.cfg.ring_max_frames,
+            "commit_enabled": self.cfg.commit_enabled,
+            "commit_flush_every": self.cfg.commit_flush_every,
+            "commit_flush_ms": self.cfg.commit_flush_ms,
+            "commit_queue_max": self.cfg.commit_queue_max,
+            "replay_on_disconnect": self.cfg.replay_on_disconnect,
+            "replay_last_n": self.cfg.replay_last_n,
+            "replay_tick_ms": self.cfg.replay_tick_ms,
+            "mapping_mode": self.cfg.mapping_mode,
+            "peer_enabled": self.cfg.peer_enabled,
+            "sync_enabled": self.cfg.sync_enabled,
+            "robot_comms_enabled": self.cfg.robot_comms_enabled,
+            "robot_broadcast_interval_ms": self.cfg.robot_broadcast_interval_ms,
+            "billing_enabled": self.cfg.billing_enabled,
+            "billing_mode": self.cfg.billing_mode,
+            "billing_account_mode": self.cfg.billing_account_mode,
+            "cost_per_teleop_frame": self.cfg.cost_per_teleop_frame,
+            "cost_per_peer_message": self.cfg.cost_per_peer_message,
+            "cost_per_sync_block": self.cfg.cost_per_sync_block,
+            "cost_per_kb_logged": self.cfg.cost_per_kb_logged,
+        }
+
+    def apply_config_patch(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        for k, v in patch.items():
+            if not hasattr(self.cfg, k):
+                continue
+            if k in {"store_session_raw","record_teleop","record_autonomy","commit_enabled","replay_on_disconnect","peer_enabled","sync_enabled","robot_comms_enabled","billing_enabled"}:
+                setattr(self.cfg, k, bool(v))
+            elif k in {"ring_max_frames","commit_flush_every","commit_flush_ms","commit_queue_max","replay_last_n","replay_tick_ms","robot_broadcast_interval_ms"}:
+                setattr(self.cfg, k, int(v))
+            elif k in {"mapping_mode"}:
+                if str(v) in {"gamepad_axes","passthrough_only"}:
+                    setattr(self.cfg, k, str(v))
+            elif k in {"billing_mode"}:
+                if str(v) in {"off","meter_only","enforce"}:
+                    setattr(self.cfg, k, str(v))
+            elif k in {"billing_account_mode"}:
+                if str(v) in {"session","provided"}:
+                    setattr(self.cfg, k, str(v))
+            elif k in {"cost_per_teleop_frame","cost_per_peer_message","cost_per_sync_block","cost_per_kb_logged"}:
+                setattr(self.cfg, k, float(v))
+
+        self.rec.max_frames = int(self.cfg.ring_max_frames)
+        return self.config_dict()
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "app": {"name": APP_NAME, "version": APP_VERSION},
+            "identity": {"instance_id": self.instance_id},
+            "human_active": self._human_active,
+            "active_session": self._active_session,
+            "active_account": self._active_account,
+            "latest_state": self._latest_state,
+            "latest_receipt": self._latest_receipt,
+            "recorder": self.rec.stats(),
+            "peers": self.p.list_peers(),
+            "config": self.config_dict(),
+        }
+
+# ----------------------------
+# FastAPI
+# ----------------------------
+
+app = FastAPI(title=f"{APP_NAME} v{APP_VERSION}")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+bridge: BridgeCore
+persistence: Persistence
+
+@app.websocket("/ws/teleop/{session_id}")
+async def ws_teleop(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    await bridge.on_connect(session_id)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            out = await bridge.process_teleop_frame(data)
+            await websocket.send_json(out)
+    except WebSocketDisconnect:
+        await bridge.on_disconnect()
+
+@app.get("/api/status")
+def api_status():
+    return bridge.status()
+
+@app.get("/api/config")
+def api_get_config():
+    return bridge.config_dict()
+
+@app.post("/api/config")
+async def api_set_config(patch: Dict[str, Any]):
+    before = bridge.cfg.commit_enabled
+    new_cfg = bridge.apply_config_patch(patch)
+    after = bridge.cfg.commit_enabled
+    if (not before) and after:
+        await bridge.committer.start()
+    return new_cfg
+
+@app.get("/api/sessions")
+def api_sessions():
+    return persistence.sessions()
+
+# ---- peers ----
+
+@app.get("/api/peers")
+def api_peers():
+    return persistence.list_peers()
+
+@app.post("/api/peers")
+def api_peer_upsert(peer: Dict[str, Any], x_admin_key: Optional[str] = Header(default=None)):
+    if bridge.admin_key and (x_admin_key != bridge.admin_key):
+        raise HTTPException(status_code=401, detail="admin_key_required")
+
+    peer_id = str(peer.get("peer_id") or "").strip()
+    name = str(peer.get("name") or peer_id).strip()
+    url = str(peer.get("url") or "").strip()
+    shared_key = str(peer.get("shared_key") or "").strip()
+    enabled = bool(peer.get("enabled", True))
+
+    if not peer_id or not url or not shared_key:
+        raise HTTPException(status_code=400, detail="peer_id,url,shared_key required")
+
+    persistence.upsert_peer(peer_id, name, url, shared_key, enabled)
+    return {"ok": True}
+
+@app.post("/peer/message")
+async def peer_message(msg: Dict[str, Any]):
+    if not bridge.cfg.peer_enabled:
+        raise HTTPException(status_code=403, detail="peer_disabled")
+
+    from_peer = str(msg.get("to_peer") or "").strip()
+    # NOTE: sender provides which peer_id they're targeting here as "to_peer";
+    # for verification we require them to be known locally under that id.
+    # In practice, set each side's peer_id to the other side's local label.
+    if not from_peer:
+        raise HTTPException(status_code=400, detail="to_peer required")
+
+    if not bridge._peer_verify(from_peer, msg):
+        raise HTTPException(status_code=401, detail="bad_signature")
+
+    body = msg.get("body", {})
+    fr = Frame(
+        kind="peer",
+        t_wall=now_wall(),
+        t_mono=now_mono(),
+        session=bridge._active_session,
+        account=bridge._active_account,
+        input_frame={"direction": "inbound", "from_peer": from_peer, "body": body},
+        device_cmd={},
+        device_state=bridge._latest_state or {},
+        device_receipt={"ok": True},
+    )
+    bridge.rec.push(fr)
+    if bridge.cfg.commit_enabled:
+        await bridge.committer.submit(fr)
+
+    # optional: allow inbound robot_cmd passthrough (still adapter-based)
+    if isinstance(body, dict) and body.get("type") == "robot_cmd" and isinstance(body.get("cmd"), dict):
+        # billing: inbound commands are still "usage"; charge log_kb only
+        acct = bridge._active_account
+        payload_kb = max(1.0, len(jcanon(body).encode("utf-8")) / 1024.0)
+        if acct and bridge._billing_effective_mode() != "off":
+            ok = bridge._charge(acct, "inbound_cmd_log_kb", payload_kb, payload_kb * bridge.cfg.cost_per_kb_logged)
+            if bridge._billing_effective_mode() == "enforce" and (not ok):
+                return {"ok": False, "reason": "insufficient_credits"}
+
+        _state, _receipt = await bridge.device.apply(dict(body["cmd"]))
+        bridge._latest_state = _state
+        bridge._latest_receipt = _receipt
+
+    return {"ok": True}
+
+@app.post("/api/peer/send")
+async def api_peer_send(req: Dict[str, Any]):
+    peer_id = str(req.get("peer_id") or "").strip()
+    body = req.get("body", {})
+    if not peer_id:
+        raise HTTPException(status_code=400, detail="peer_id required")
+
+    # use active account if any
+    acct = bridge._active_account
+    return await bridge.peer_send(peer_id, body if isinstance(body, dict) else {"body": body}, account_id=acct)
+
+# ---- sync ----
+
+@app.get("/sync/heads")
+def sync_heads():
+    if not bridge.cfg.sync_enabled:
+        raise HTTPException(status_code=403, detail="sync_disabled")
+    return {
+        "instance_id": bridge.instance_id,
+        "world": bridge.world_name,
+        "head_hash": persistence.head_hash(bridge.world_name),
+        "time": now_wall(),
+    }
+
+@app.get("/sync/blocks")
+def sync_blocks(since_ts: float = 0.0, limit: int = 1000):
+    if not bridge.cfg.sync_enabled:
+        raise HTTPException(status_code=403, detail="sync_disabled")
+    blocks = persistence.get_blocks_since_ts(bridge.world_name, float(since_ts), int(limit))
+    return {"world": bridge.world_name, "blocks": blocks}
+
+@app.post("/sync/blocks")
+async def sync_blocks_in(req: Dict[str, Any]):
+    if not bridge.cfg.sync_enabled:
+        raise HTTPException(status_code=403, detail="sync_disabled")
+
+    source = str(req.get("source_instance") or "unknown")
+    blocks = req.get("blocks", [])
+    if not isinstance(blocks, list):
+        raise HTTPException(status_code=400, detail="blocks must be list")
+
+    acct = bridge._active_account
+    if acct and bridge._billing_effective_mode() != "off":
+        cost = len(blocks) * bridge.cfg.cost_per_sync_block
+        ok = bridge._charge(acct, "sync_blocks_in", float(len(blocks)), float(cost))
+        if bridge._billing_effective_mode() == "enforce" and (not ok):
+            return {"ok": False, "reason": "insufficient_credits"}
+
+    # re-chain into a separate world namespace
+    world = f"PeerInbox:{source}"
+    prev = persistence.head_hash(world)
+
+    out_blocks: List[Block] = []
+    for b in blocks:
+        payload = str(b.get("payload") or "")
+        ts = float(b.get("ts") or now_wall())
+
+        # store foreign payload as-is, but chain locally
+        bid = sha256_hex(f"{prev or ''}|{world}|{payload}")[:32]
+        h = sha256_hex(jcanon({"id": bid, "ts": ts, "world": world, "prev_hash": prev, "payload": payload}))
+        out_blocks.append(Block(id=bid, ts=ts, world=world, prev_hash=prev, payload=payload, hash=h))
+        prev = h
+
+    persistence.append_many(out_blocks)
+
+    fr = Frame(
+        kind="sync",
+        t_wall=now_wall(),
+        t_mono=now_mono(),
+        session=bridge._active_session,
+        account=acct,
+        input_frame={"source_instance": source, "count": len(blocks)},
+        device_cmd={},
+        device_state=bridge._latest_state or {},
+        device_receipt={"stored": len(out_blocks), "world": world},
+    )
+    bridge.rec.push(fr)
+    if bridge.cfg.commit_enabled:
+        await bridge.committer.submit(fr)
+
+    return {"ok": True, "stored": len(out_blocks), "world": world}
+
+# ---- billing ----
+
+@app.get("/api/billing/config")
+def billing_config():
+    return {
+        "billing_enabled": bridge.cfg.billing_enabled,
+        "billing_mode": bridge.cfg.billing_mode,
+        "billing_account_mode": bridge.cfg.billing_account_mode,
+        "cost_per_teleop_frame": bridge.cfg.cost_per_teleop_frame,
+        "cost_per_peer_message": bridge.cfg.cost_per_peer_message,
+        "cost_per_sync_block": bridge.cfg.cost_per_sync_block,
+        "cost_per_kb_logged": bridge.cfg.cost_per_kb_logged,
+    }
+
+@app.post("/api/billing/config")
+def billing_config_set(patch: Dict[str, Any], x_admin_key: Optional[str] = Header(default=None)):
+    if bridge.admin_key and (x_admin_key != bridge.admin_key):
+        raise HTTPException(status_code=401, detail="admin_key_required")
+    return bridge.apply_config_patch(patch)
+
+@app.get("/api/billing/wallet/{account_id}")
+def billing_wallet(account_id: str):
+    bal = persistence.wallet_get(account_id)
+    return {"account_id": account_id, "balance": bal, "recent": persistence.usage_recent(account_id, 50)}
+
+@app.post("/api/billing/credit")
+def billing_credit(req: Dict[str, Any], x_admin_key: Optional[str] = Header(default=None)):
+    if bridge.admin_key and (x_admin_key != bridge.admin_key):
+        raise HTTPException(status_code=401, detail="admin_key_required")
+
+    account_id = str(req.get("account_id") or "").strip()
+    amount = float(req.get("amount") or 0.0)
+    if not account_id or amount == 0.0:
+        raise HTTPException(status_code=400, detail="account_id and nonzero amount required")
+    persistence.wallet_add(account_id, amount)
+    return {"ok": True, "account_id": account_id, "balance": persistence.wallet_get(account_id)}
+
+# ----------------------------
+# main
+# ----------------------------
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", default="aetherspan_v11.db")
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8000)
+    return ap.parse_args()
+
+def main():
+    global bridge, persistence
+    args = parse_args()
+
+    cfg = BridgeConfig()
+    persistence = Persistence(args.db)
+    bridge = BridgeCore(persistence, cfg)
+
+    async def boot():
+        await bridge.start()
+
+    asyncio.run(boot())
+
+    print(f"✅ {APP_NAME} v{APP_VERSION} — RUNNING")
+    print(f"Instance: {bridge.instance_id}")
+    print(f"DB: {args.db}")
+    print(f"WS: ws://{args.host}:{args.port}/ws/teleop/{{session_id}}")
+    print(f"HTTP: http://{args.host}:{args.port}/api/status")
+
+    uvicorn.run(app, host=args.host, port=args.port)
+
+if __name__ == "__main__":
+    main()
